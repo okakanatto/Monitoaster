@@ -1,0 +1,5 @@
+# 配布用ビルド(MSVC)の硬化設定。S-09: CRTを静的リンク。S-10: CFG。
+# ASLR(高エントロピー)と DEP は MSVC x64 の既定で有効。CI が PE ヘッダーで確かめる。
+# 注意: 環境変数 RUSTFLAGS を設定するとここが無視される。CI で RUSTFLAGS を使わないこと。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "control-flow-guard=checks"]

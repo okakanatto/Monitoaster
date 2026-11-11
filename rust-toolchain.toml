@@ -1,0 +1,5 @@
+# ツールチェーンを固定する(S-13)。上げるときは CI が緑になることを確かめてからコミットする。
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy", "llvm-tools"]
+targets = ["x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu"]

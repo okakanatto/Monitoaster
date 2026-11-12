@@ -83,9 +83,12 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 45
     steps:
+      # プルリクエストでも、マージ結果ではなく head のコミットをビルドする。
+      # 成果物の名前と SHA-256 の表に付けるハッシュ(下の HEAD_SHA)と、ビルドしたツリーを一致させるため。
       - name: 取り出す
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - name: Rust を入れる(rust-toolchain.toml の版、components、targets)

@@ -1,0 +1,231 @@
+# CI(docs/m0.md 作業2)。spec.md 7章の S-01〜S-15 のうち、自動で確かめられるものをここで検査する。
+#
+# - アクションはコミットハッシュで固定し、行末にタグを書く(S-13)。上げるときは、そのタグが
+#   指すコミット(注釈付きタグならタグオブジェクトではなく、その先のコミット)のハッシュに書き換える。
+# - Rust は rust-toolchain.toml(1.97.0)に従って rustup が入れる。ツールチェーン導入用のアクションは使わない。
+#   ランナーに入っている rustup(1.28 以降)の `rustup toolchain install` を引数なしで呼ぶと、
+#   rust-toolchain.toml の版と components、targets が入る。
+# - 環境変数 RUSTFLAGS は設定しない。設定すると .cargo/config.toml(CRT の静的リンク、CFG)が無視される。
+# - シェルは Windows でも bash(Git Bash)。tools/ の検査スクリプトを同じ形で流すため。
+#   改行は .gitattributes で LF に固定してある(Windows で CRLF になるとスクリプトが動かない)。
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+# 同じブランチ(プルリクエストなら同じ番号)の古い実行は取り消す。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  lint-test:
+    name: lint-test(Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: 取り出す
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust を入れる(rust-toolchain.toml の版、components、targets)
+        run: |
+          rustup --version
+          rustup toolchain install --no-self-update
+          rustc --version --verbose
+          cargo --version
+
+      - name: 書式(cargo fmt)
+        run: cargo fmt --check
+
+      - name: ソースの検査(S-01、S-03〜S-06、S-11、S-15)
+        run: bash tools/check_source.sh
+
+      - name: clippy(Linux)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: clippy(Windows 向けコードの型検査、windows-gnu)
+        run: cargo clippy --target x86_64-pc-windows-gnu --locked -- -D warnings
+
+      - name: 単体テスト
+        run: cargo test --locked
+
+      # exe の検査スクリプトそのものを Linux 側でも確かめる。配布用ではない(配布用は windows ジョブの MSVC 版)。
+      - name: mingw のリンカーを入れる
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+
+      - name: リリースビルド(windows-gnu)
+        run: cargo build --release --locked --target x86_64-pc-windows-gnu
+
+      - name: exe の検査(windows-gnu)
+        run: bash tools/check_exe.sh target/x86_64-pc-windows-gnu/release/Monitoaster.exe gnu
+
+  windows:
+    name: windows(MSVC、配布用 exe)
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - name: 取り出す
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust を入れる(rust-toolchain.toml の版、components、targets)
+        run: |
+          rustup --version
+          rustup toolchain install --no-self-update
+          rustc --version --verbose
+          cargo --version
+
+      - name: リリースビルド(MSVC)
+        run: cargo build --release --locked
+
+      - name: 単体テスト
+        run: cargo test --locked
+
+      - name: exe の検査(S-01、S-02、S-04、S-05、S-09、S-10、8章)
+        run: bash tools/check_exe.sh target/release/Monitoaster.exe msvc
+
+      # 仮想マシン上での描画の初期化などの参考値(spec.md 9章)。
+      # 終了コードが 0 でなくても、ここでは止めずに成果物を上げ、最後のステップで落とす
+      # (実機確認に使う m0_probe.exe を手元に届けるため)。
+      # GNU の timeout があれば 90 秒で打ち切る(124 は時間切れ)。なければこのステップの timeout-minutes に任せる。
+      - name: 検証用 exe のヘッドレス実行(m0_probe.exe --headless)
+        id: probe
+        timeout-minutes: 3
+        run: |
+          probe=target/release/m0_probe.exe
+          code=0
+          if timeout --version >/dev/null 2>&1; then
+            timeout -k 10s 90s "$probe" --headless >probe.txt 2>probe-stderr.txt || code=$?
+          else
+            "$probe" --headless >probe.txt 2>probe-stderr.txt || code=$?
+          fi
+          echo "code=$code" >>"$GITHUB_OUTPUT"
+
+          cat probe.txt
+          if [[ -s probe-stderr.txt ]]; then
+            echo "--- 標準エラー出力"
+            cat probe-stderr.txt
+          fi
+          if [[ $code -ne 0 ]]; then
+            echo "::warning::m0_probe.exe --headless の終了コードが ${code} でした(124 は時間切れ)"
+          fi
+
+          {
+            echo "## 検証用 exe(m0_probe.exe --headless)"
+            echo
+            echo "終了コード: ${code}"
+            echo
+            echo '````text'
+            cat probe.txt
+            echo '````'
+            if [[ -s probe-stderr.txt ]]; then
+              echo
+              echo "標準エラー出力:"
+              echo
+              echo '````text'
+              cat probe-stderr.txt
+              echo '````'
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: SHA-256 を算出する
+        id: dist
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          rm -rf dist
+          mkdir dist
+          cp target/release/Monitoaster.exe target/release/m0_probe.exe probe.txt dist/
+          cd dist
+          sha256sum Monitoaster.exe m0_probe.exe >SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          echo "name=Monitoaster-M0-windows-x64-${HEAD_SHA:0:7}" >>"$GITHUB_OUTPUT"
+
+          {
+            echo "## 成果物"
+            echo
+            echo "コミット: \`${HEAD_SHA}\`"
+            echo
+            echo "| ファイル | サイズ | SHA-256 |"
+            echo "|---|---:|---|"
+            for f in Monitoaster.exe m0_probe.exe; do
+              size=$(($(wc -c <"$f")))
+              mib=$(awk -v s="$size" 'BEGIN { printf "%.2f", s / 1048576 }')
+              hash=$(sha256sum "$f" | cut -d ' ' -f 1)
+              echo "| ${f} | ${size} バイト(${mib} MiB) | \`${hash}\` |"
+            done
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: 成果物を上げる
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.dist.outputs.name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 検証用 exe の終了コードを確かめる
+        if: steps.probe.outputs.code != '0'
+        env:
+          CODE: ${{ steps.probe.outputs.code }}
+        run: |
+          echo "::error::m0_probe.exe --headless の終了コードが ${CODE} でした(124 は時間切れ)。成果物は上げてあります"
+          exit 1
+
+  supply-chain:
+    name: supply-chain(cargo-deny、cargo-audit)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: 取り出す
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust を入れる(rust-toolchain.toml の版、components、targets)
+        run: |
+          rustup --version
+          rustup toolchain install --no-self-update
+          rustc --version --verbose
+          cargo --version
+
+      # cargo-deny は EmbarkStudios/cargo-deny-action(v2.1.1、コミット 3c6349835b2b7b196a839186cb8b78e02f7b5f25)
+      # を使わず、cargo install で入れる。理由:
+      # - このアクションは Docker(rust:1.85.0-alpine)の中で動き、rust-toolchain.toml を見て
+      #   1.97.0 を components と Windows の targets ごとコンテナの中にもう一度入れる。
+      # - Dockerfile が cargo-deny の配布バイナリを curl で取ってきて、チェックサムを確かめずに使う。
+      #   アクションをハッシュで固定しても、中で取ってくる物は固定されない(S-13)。
+      # cargo install --locked なら、crates.io のチェックサムと同梱の Cargo.lock で中身が決まり、
+      # ビルドに使うツールチェーンも rust-toolchain.toml の 1.97.0 に揃う。
+      # 版を上げるときは、手元で cargo deny check が通ることを確かめてから。
+      - name: cargo-deny を入れる
+        run: cargo install cargo-deny --locked --version 0.20.2
+
+      - name: cargo-audit を入れる
+        run: cargo install cargo-audit --locked --version 0.23.0
+
+      - name: cargo-deny(S-12。許可リスト、ライセンス、取得元、脆弱性。deny.toml)
+        run: cargo deny --locked check
+
+      - name: cargo-audit(脆弱性)
+        run: cargo audit

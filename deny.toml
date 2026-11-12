@@ -1,0 +1,90 @@
+# cargo-deny の設定(docs/m0.md 作業4)。CI の supply-chain ジョブが `cargo deny --locked check` で使う。
+# cargo-deny 0.20.2 の書式。キーの意味は cargo-deny の deny.template.toml を参照。
+#
+# S-12: 直接依存は windows、serde、serde_json の3つ。Cargo.lock に載るクレートは
+# [bans] の allow に名前で並べ、知らないクレートが入ったら落とす。クレートを足すには
+# docs/spec.md の改訂が先に要る(CLAUDE.md)。
+
+[graph]
+# 依存グラフを組む対象。windows クレートは cfg(windows) の依存なので、Windows の2つを必ず含める。
+targets = [
+    "x86_64-pc-windows-msvc", # 配布用(CI の windows ジョブ)
+    "x86_64-pc-windows-gnu",  # Linux 上の型検査とリンクの確認
+    "x86_64-unknown-linux-gnu", # Linux 上の単体テスト
+]
+all-features = false
+no-default-features = false
+
+[advisories]
+# 既定のまま(RustSec の advisory-db を取得し、脆弱性・保守終了・不健全・取り下げを調べる)。
+# 無視するものを足すときは、ID と理由を書く。
+ignore = []
+
+[licenses]
+# 本体は MIT。依存のライセンスが下の3つで満たせることを確かめる。
+# - MIT: 本体、zmij。ほかのクレートも「MIT OR Apache-2.0」「Unlicense OR MIT」の MIT で満たす
+# - Apache-2.0: 「MIT OR Apache-2.0」のもう片方
+# - Unicode-3.0: unicode-ident の「(MIT OR Apache-2.0) AND Unicode-3.0」(proc-macro2 経由。ビルド時だけ使う)
+# これ以外が要るクレートが入ったら、理由を添えて利用者に相談する(m0.md 作業4)。
+allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
+confidence-threshold = 0.8
+exceptions = []
+
+[licenses.private]
+# 本体(publish = false)も調べる。
+ignore = false
+
+[bans]
+# syn は 2(windows-implement、windows-interface)と 3(serde_derive)が並ぶ。
+# どちらもビルド時だけの proc-macro で、上流が揃うまで解消できないので警告にとどめる。
+multiple-versions = "warn"
+# バージョン指定が * の依存を拒否する。
+wildcards = "deny"
+allow-wildcard-paths = false
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+deny = []
+skip = []
+skip-tree = []
+# 許可リスト(S-12)。ここにないクレートが依存グラフに入ると `cargo deny check bans` が落ちる。
+# 名前だけで書き、バージョンは Cargo.lock(CI は --locked)で固定する。
+allow-workspace = false
+allow = [
+    { crate = "monitoaster", reason = "本体" },
+
+    # serde(設定ファイルの読み書き)
+    { crate = "serde", reason = "直接依存(S-12)" },
+    { crate = "serde_core", reason = "serde と serde_json が使う" },
+    { crate = "serde_derive", reason = "serde の derive(proc-macro、ビルド時だけ)" },
+    { crate = "proc-macro2", reason = "proc-macro の土台(serde_derive、windows-implement、windows-interface)" },
+    { crate = "quote", reason = "proc-macro の土台" },
+    { crate = "syn", reason = "proc-macro の土台。2 は windows 側、3 は serde_derive" },
+    { crate = "unicode-ident", reason = "proc-macro2 と syn が使う" },
+
+    # serde_json
+    { crate = "serde_json", reason = "直接依存(S-12)" },
+    { crate = "itoa", reason = "serde_json が使う(整数の書き出し)" },
+    { crate = "memchr", reason = "serde_json が使う(文字列の走査)" },
+    { crate = "zmij", reason = "serde_json が使う(浮動小数点数の書き出し)" },
+
+    # windows(Win32 の呼び出し。cfg(windows) だけ)
+    { crate = "windows", reason = "直接依存(S-12)" },
+    { crate = "windows-core", reason = "windows が使う" },
+    { crate = "windows-collections", reason = "windows が使う" },
+    { crate = "windows-future", reason = "windows が使う" },
+    { crate = "windows-numerics", reason = "windows が使う" },
+    { crate = "windows-threading", reason = "windows-future が使う" },
+    { crate = "windows-implement", reason = "windows-core の proc-macro(ビルド時だけ)" },
+    { crate = "windows-interface", reason = "windows-core の proc-macro(ビルド時だけ)" },
+    { crate = "windows-link", reason = "windows-core が使う(DLL のインポート)" },
+    { crate = "windows-result", reason = "windows-core が使う" },
+    { crate = "windows-strings", reason = "windows-core が使う" },
+]
+
+[sources]
+# crates.io だけ。ほかのレジストリと git 依存は拒否する。
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

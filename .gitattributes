@@ -1,0 +1,16 @@
+# 改行を LF に固定する。Windows ランナーの actions/checkout は core.autocrlf=true の Git で
+# 取り出すため、指定がないとテキストが CRLF に変わる。そうなると tools/ のシェルスクリプトが
+# bash で動かず(行末の CR がコマンドの一部になる)、ソースやマニフェスト(assets/)の中身も
+# Linux と Windows で食い違う。
+* text=auto eol=lf
+
+# 改行を変えてはいけないもの(足すときはここに並べる)。
+*.exe binary
+*.dll binary
+*.ico binary
+*.png binary
+*.wav binary
+
+# cmd.exe が読むバッチは CRLF にする(今はない。置くときのため)。
+*.bat text eol=crlf
+*.cmd text eol=crlf

@@ -56,10 +56,19 @@ BANNED_API=(
   CreateProcess ShellExecute WinExec
 )
 
-# S-03、S-06: レジストリとクリップボードに書くAPI(前方一致)。標準ライブラリは使わないので、
-# インポートにあれば自前のコードが呼んでいる。ファイルのAPI(CreateFileW、MoveFileExW など)は
-# 設定の保存で標準ライブラリが使うので、ここでは調べない(check_source.sh が受け持つ)。
-WRITE_API=(RegSetValue RegSetKeyValue RegCreateKey SHSetValue OpenClipboard SetClipboardData)
+# S-03、S-06: レジストリ・クリップボード・INI・メタファイルなどに書くAPI(前方一致)。標準ライブラリが
+# 決してインポートしないものだけを並べるので、インポートにあれば自前のコードが呼んでいる。
+# 標準ライブラリが std::fs のために使うファイルのAPI(CreateFileW、MoveFileExW、CreateDirectoryW、
+# RemoveDirectoryW、CreateHardLinkW、CreateSymbolicLinkW、SetFileAttributesW など)は、
+# ここでは調べない(check_source.sh が受け持つ)。
+WRITE_API=(
+  RegSetValue RegSetKeyValue RegCreateKey SHSetValue
+  OpenClipboard SetClipboardData OleSetClipboard
+  WriteProfile WritePrivateProfile # INI ファイル(win.ini も。WriteProfileString、WriteProfileSection)
+  SHCreateDirectory SHFileOperation      # シェルのフォルダー作成、ファイル操作
+  # メタファイル。そのDCに画面から BitBlt すると、画面の内容がファイルに残る
+  CreateEnhMetaFile CreateMetaFile CopyEnhMetaFile CopyMetaFile
+)
 
 # S-15: ログの出力先になるAPI(前方一致)。
 # shellcheck disable=SC2034 # sym_check が配列の名前で参照する
@@ -248,7 +257,7 @@ sym_check() {
 }
 
 result "S-04 S-05" "禁止API($(printf '%s ' "${BANNED_API[@]}" | sed 's/ $//; s/ /、/g'))をインポートしていない" "$(sym_check BANNED_API)"
-result "S-03 S-06" "レジストリ・クリップボードに書くAPI($(printf '%s ' "${WRITE_API[@]}" | sed 's/ $//; s/ /、/g'))をインポートしていない" "$(sym_check WRITE_API)"
+result "S-03 S-06" "レジストリ・クリップボード・INI・メタファイルに書くAPI($(printf '%s ' "${WRITE_API[@]}" | sed 's/ $//; s/ /、/g'))をインポートしていない" "$(sym_check WRITE_API)"
 result "S-15" "OutputDebugString をインポートしていない" "$(sym_check LOG_API)"
 
 # ---- PE ヘッダー(S-10) -------------------------------------------------------------------

@@ -12,6 +12,13 @@
 //!   いないので `DefWindowProcW` に回す。処理が最初に受け取るのは `WM_NCCREATE`。
 //! - 処理が持つ値は、ウィンドウが破棄され、処理の呼び出しがすべて終わったときに解放する。
 //!   処理の中で自分のウィンドウを破棄してもよい。
+//! - ただし、処理の中で自分のウィンドウを破棄すると、入れ子で届く `WM_DESTROY` と `WM_NCDESTROY`
+//!   は処理からは見えない(`DefWindowProcW` に回る)。終了の処理([`post_quit`] など)を
+//!   `WM_DESTROY` に置いている場合は、処理の外で破棄するか、処理の中で破棄した後に自分で行うこと
+//!   (「終了」のコマンドの処理の中で破棄すると、`WM_DESTROY` に置いた [`post_quit`] が呼ばれない)。
+//! - `WM_COMMAND` の lParam(送ってきたコントロール)は、自分の子であることを確かめてから
+//!   [`Command::control`] にする。`WM_COMMAND` はほかのプロセスからも任意の lParam で送れるため
+//!   (S-04: ほかのプロセスのウィンドウは [`WindowId`] でしか渡さない)。
 //! - 複数のウィンドウの処理が値を共有する場合(`Rc<RefCell<_>>` など)、入れ子の呼び出しで
 //!   借用が重なりうる。共有する側でも `try_borrow_mut` などで守ること。
 //!
@@ -33,6 +40,7 @@ use windows::Win32::Graphics::Gdi::{
     SYS_COLOR_INDEX, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Controls::{
     BST_CHECKED, BST_UNCHECKED, EM_REPLACESEL, EM_SETLIMITTEXT, EM_SETSEL,
 };
@@ -44,13 +52,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     BM_GETCHECK, BM_SETCHECK, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
     DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetClientRect,
     GetForegroundWindow, GetMessageW, GetWindowDisplayAffinity, GetWindowLongPtrW, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, HMENU, IDC_ARROW, KillTimer, LWA_ALPHA, LoadCursorW, MSG,
-    MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, NONCLIENTMETRICSW, PM_REMOVE, PeekMessageW,
-    PostQuitMessage, QS_ALLINPUT, RegisterClassExW, SET_WINDOW_POS_FLAGS, SHOW_WINDOW_CMD,
-    SPI_GETNONCLIENTMETRICS, SendMessageW, SetLayeredWindowAttributes, SetTimer,
-    SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-    TranslateMessage, WINDOW_DISPLAY_AFFINITY, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
-    WM_DPICHANGED, WM_NCCREATE, WM_NCDESTROY, WM_QUIT, WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_CHILD,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HMENU, IDC_ARROW, IsChild,
+    KillTimer, LWA_ALPHA, LoadCursorW, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx,
+    NONCLIENTMETRICSW, PM_REMOVE, PeekMessageW, PostQuitMessage, QS_ALLINPUT, RegisterClassExW,
+    SET_WINDOW_POS_FLAGS, SHOW_WINDOW_CMD, SPI_GETNONCLIENTMETRICS, SendMessageW,
+    SetLayeredWindowAttributes, SetTimer, SetWindowDisplayAffinity, SetWindowLongPtrW,
+    SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_DISPLAY_AFFINITY,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_DPICHANGED, WM_NCCREATE, WM_NCDESTROY, WM_QUIT,
+    WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_CHILD,
 };
 use windows::core::{Error, PCWSTR, Result};
 
@@ -254,7 +263,7 @@ unsafe extern "system" fn window_proc(
     };
 
     // SAFETY: OS から受け取ったメッセージの引数そのもの。
-    let message = unsafe { Message::from_raw(msg, wparam, lparam) };
+    let message = unsafe { Message::from_raw(hwnd, msg, wparam, lparam) };
     // 処理を呼ぶのは借用できたときだけ。入れ子で届いたメッセージ(借用中)は既定の処理に回す。
     let result = match state.handler.try_borrow_mut() {
         Ok(mut handler) => handler(Window(hwnd), message),
@@ -289,17 +298,25 @@ pub struct Message {
     lparam: isize,
     /// WM_DPICHANGED のときだけ、lparam が指す提案の矩形。
     suggested_rect: Option<RECT>,
+    /// WM_COMMAND のときだけ、lparam が自分の子のコントロールなら、そのハンドル([`own_child`])。
+    control: Option<HWND>,
 }
 
 impl Message {
     /// # Safety
     ///
-    /// ウィンドウプロシージャが受け取った引数そのものであること。`WM_DPICHANGED` の `lparam` は
-    /// RECT を指していること。
-    unsafe fn from_raw(id: u32, wparam: WPARAM, lparam: LPARAM) -> Self {
+    /// ウィンドウプロシージャが受け取った引数そのものであること(`hwnd` はメッセージを受け取った
+    /// 自分のウィンドウ)。`WM_DPICHANGED` の `lparam` は RECT を指していること。
+    unsafe fn from_raw(hwnd: HWND, id: u32, wparam: WPARAM, lparam: LPARAM) -> Self {
         let suggested_rect = if id == WM_DPICHANGED && lparam.0 != 0 {
             // SAFETY: WM_DPICHANGED の lparam は、OS が用意した RECT を指す(呼び出し側の前提)。
             Some(unsafe { (lparam.0 as *const RECT).read_unaligned() })
+        } else {
+            None
+        };
+        // WM_COMMAND はほかのプロセスからも任意の lparam で送れる。自分の子だけを受け取る(S-04)。
+        let control = if id == WM_COMMAND && lparam.0 != 0 {
+            own_child(hwnd, lparam.0)
         } else {
             None
         };
@@ -308,6 +325,7 @@ impl Message {
             wparam: wparam.0,
             lparam: lparam.0,
             suggested_rect,
+            control,
         }
     }
 
@@ -322,6 +340,9 @@ impl Message {
     }
 
     /// lParam。ポインターを含むメッセージでも、ここから先を読む手段は用意しない。
+    ///
+    /// ハンドルを含むメッセージでも、この値から [`Window`] を作る手段は用意しない
+    /// (`WM_COMMAND` のコントロールは [`Message::command`] で、確かめたものだけを受け取る)。
     pub fn lparam(&self) -> isize {
         self.lparam
     }
@@ -331,12 +352,10 @@ impl Message {
         if self.id != WM_COMMAND {
             return None;
         }
-        let control =
-            (self.lparam != 0).then(|| Window(HWND(without_provenance_mut(self.lparam as usize))));
         Some(Command {
             id: low_word(self.wparam),
             code: high_word(self.wparam),
-            control,
+            control: self.control.map(Window),
         })
     }
 
@@ -365,7 +384,29 @@ pub struct Command {
     /// 通知コード(`BN_CLICKED`、`EN_CHANGE` など)。メニューなら 0。
     pub code: u16,
     /// 送ってきたコントロール。メニューやアクセラレーターなら `None`。
+    ///
+    /// lParam が自分の子(子孫を含む)でなければ `None`(ほかのプロセスが任意の lParam で送って
+    /// きた場合など。S-04)。
     pub control: Option<Window>,
+}
+
+/// `candidate`(`WM_COMMAND` の lParam)が `parent` の子(子孫を含む)で、このスレッドのウィンドウなら、
+/// そのハンドル。そうでなければ `None`。
+///
+/// IsChild だけでは、ほかのプロセスが自分のウィンドウを SetParent で `parent` の子にした場合を
+/// 除けないので、ウィンドウを作ったスレッドも比べる(子コントロールは [`create_control`] が
+/// 親と同じスレッドで作る)。
+fn own_child(parent: HWND, candidate: isize) -> Option<HWND> {
+    let child = HWND(without_provenance_mut(candidate as usize));
+    // SAFETY: ハンドルを2つ渡すだけで、ポインターとしては読まれない。無効なハンドルなら偽が返る。
+    if !unsafe { IsChild(parent, child) }.as_bool() {
+        return None;
+    }
+    // SAFETY: ハンドルを渡すだけ。プロセス ID は受け取らない(None)。無効なハンドルなら 0 が返る。
+    let owner = unsafe { GetWindowThreadProcessId(child, None) };
+    // SAFETY: 引数なし。
+    let current = unsafe { GetCurrentThreadId() };
+    (owner != 0 && owner == current).then_some(child)
 }
 
 /// `WM_DPICHANGED` の中身。
@@ -505,7 +546,8 @@ impl Window {
 
     /// ウィンドウを破棄する(DestroyWindow)。子ウィンドウもまとめて破棄される。
     ///
-    /// 自分のウィンドウの処理の中から呼んでもよい。
+    /// 自分のウィンドウの処理の中から呼んでもよい。ただしそのとき、このウィンドウの `WM_DESTROY` と
+    /// `WM_NCDESTROY` は処理に届かない(モジュールの説明を参照)。
     pub fn destroy(self) -> Result<()> {
         // SAFETY: ハンドルを渡すだけ。処理の再入はウィンドウプロシージャが守る。
         unsafe { DestroyWindow(self.0) }
@@ -922,9 +964,10 @@ pub fn wait_message() -> Pump {
 mod tests {
     use super::*;
     use windows::Win32::UI::WindowsAndMessaging::{
-        IsWindow, WM_CLOSE, WM_CREATE, WM_DESTROY, WS_OVERLAPPEDWINDOW,
+        BN_CLICKED, IsWindow, WM_CLOSE, WM_CREATE, WM_DESTROY, WS_OVERLAPPEDWINDOW,
     };
 
+    /// 96 DPI 基準の長さを、MulDiv と同じ四捨五入で拡大縮小する(i32 に収まらなければ端の値)。
     #[test]
     fn scale_for_dpi_rounds_like_muldiv() {
         assert_eq!(scale_for_dpi(640, 96), 640);
@@ -939,6 +982,7 @@ mod tests {
         assert_eq!(scale_for_dpi(i32::MIN, 192), i32::MIN);
     }
 
+    /// wParam を下位と上位の16ビット(WM_COMMAND の番号と通知コード)に分ける。
     #[test]
     fn message_words_split_wparam() {
         assert_eq!(low_word(0x1234_5678), 0x5678);
@@ -1092,6 +1136,66 @@ mod tests {
         parent.kill_timer(7).expect("タイマーの停止");
         parent.destroy().expect("破棄");
         assert!(!is_window(edit));
+    }
+
+    /// S-04: WM_COMMAND の lParam は、自分の子のコントロールのときだけ Command::control になる。
+    /// 別のトップレベルウィンドウを指す lParam や、0(メニュー)では None。
+    #[test]
+    fn command_control_requires_own_child() {
+        let class = WindowClass::register("Monitoaster.Test.CommandControl", None).expect("登録");
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::clone(&commands);
+        let parent = create_window(class, &hidden_spec(), move |_, message| {
+            let command = message.command()?;
+            seen.borrow_mut().push(command);
+            Some(0)
+        })
+        .expect("親");
+        let button = create_control(
+            ControlClass::Button,
+            42,
+            &WindowSpec {
+                title: "ボタン",
+                width: 80,
+                height: 24,
+                parent: Some(parent),
+                ..Default::default()
+            },
+        )
+        .expect("ボタン");
+        let other = create_window(class, &hidden_spec(), |_, _| None).expect("別のウィンドウ");
+        // 作成のときに届いたものは見ない。
+        commands.borrow_mut().clear();
+
+        let clicked = BN_CLICKED as u16;
+        let send_command = |control: HWND| {
+            let wparam = (usize::from(clicked) << 16) | 42;
+            // SAFETY: WM_COMMAND の引数は数値とハンドルで、ポインターとしては読まれない。
+            // 送り先は自分のスレッドのウィンドウ。
+            unsafe {
+                SendMessageW(
+                    parent.hwnd(),
+                    WM_COMMAND,
+                    Some(WPARAM(wparam)),
+                    Some(LPARAM(control.0.addr() as isize)),
+                )
+            };
+        };
+        send_command(button.hwnd());
+        send_command(other.hwnd());
+        send_command(HWND::default());
+
+        let expected = |control| Command {
+            id: 42,
+            code: clicked,
+            control,
+        };
+        assert_eq!(
+            *commands.borrow(),
+            [expected(Some(button)), expected(None), expected(None)]
+        );
+        other.destroy().expect("別のウィンドウの破棄");
+        parent.destroy().expect("破棄");
     }
 
     /// 同じ名前のクラスは2回登録できない。

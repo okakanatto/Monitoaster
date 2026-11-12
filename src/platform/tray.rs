@@ -115,6 +115,7 @@ fn copy_wide(dest: &mut [u16], text: &str) {
 mod tests {
     use super::*;
 
+    /// 入らない分は切り捨て、必ず NUL で終える。
     #[test]
     fn copy_wide_terminates_and_truncates() {
         let mut dest = [0xFFFFu16; 4];
@@ -127,6 +128,7 @@ mod tests {
         assert_eq!(dest[3], 0);
     }
 
+    /// サロゲートペアの途中では切らない。
     #[test]
     fn copy_wide_does_not_split_surrogate_pair() {
         // 🍞 は UTF-16 で2単位。NUL を除いて2単位の枠には「a」しか入らない。
@@ -141,6 +143,7 @@ mod tests {
         assert_eq!(super::super::from_wide(&dest), "a🍞");
     }
 
+    /// 写し先が空なら何もしない(添字の範囲外に書かない)。
     #[test]
     fn copy_wide_ignores_empty_destination() {
         let mut dest: [u16; 0] = [];

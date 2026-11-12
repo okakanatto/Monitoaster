@@ -11,6 +11,7 @@
 //! - ファイルに書かない(S-03、S-06)。exe の大きさは読むだけ。画面の画素はメモリ上で数えるだけ。
 //! - 他のプロセスに触れない(S-04)。前面のウィンドウは、位置・大きさとハンドルの値だけを読む。
 //! - ウィンドウのタイトルを表示・出力しない(S-15)。ファイルのパスも出さない(利用者名が入るため)。
+//!   アダプターの説明(GPU の製品名)は、利用者を特定する情報ではないので出す(項目7 などの判断に要る)。
 //!
 //! 文言は検証用の一時的なものなので、製品の文言(text モジュール)には入れず、このファイルに置く。
 //! コンソールサブシステムにしている(標準出力に書くため)。画面で使うときはコンソールから切り離す。
@@ -241,6 +242,38 @@ mod logic {
         before.is_some() && before == at && at == after
     }
 
+    /// Microsoft Basic Render Driver の (VendorId, DeviceId)。
+    pub const BASIC_RENDER_IDS: (u32, u32) = (0x1414, 0x8C);
+
+    /// ソフトウェアで描くアダプター(Microsoft Basic Render Driver)か。
+    ///
+    /// GPU のない環境で主アダプターになった Basic Render Driver には DXGI_ADAPTER_FLAG_SOFTWARE が
+    /// 立たないので、旗に加えて ID でも見分ける。
+    pub fn is_basic_render(vendor_id: u32, device_id: u32, software_flag: bool) -> bool {
+        software_flag || (vendor_id, device_id) == BASIC_RENDER_IDS
+    }
+
+    /// アダプターの説明と ID。「NVIDIA GeForce RTX 3060(VendorId 0x10DE、DeviceId 0x2504)」。
+    /// ソフトウェアで描くアダプターなら、そう明記する。
+    pub fn adapter_text(
+        description: &str,
+        vendor_id: u32,
+        device_id: u32,
+        software_flag: bool,
+    ) -> String {
+        let description = if description.is_empty() {
+            "説明なし"
+        } else {
+            description
+        };
+        let text = format!("{description}(VendorId 0x{vendor_id:04X}、DeviceId 0x{device_id:04X})");
+        if is_basic_render(vendor_id, device_id, software_flag) {
+            format!("{text}。GPU ではなく、ソフトウェア(Microsoft Basic Render Driver)で描く")
+        } else {
+            text
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -249,7 +282,7 @@ mod logic {
             colors.iter().flat_map(|&[r, g, b]| [b, g, r, 0]).collect()
         }
 
-        /// 項目2・3: マゼンタに近い画素だけを数える(許容差は R・G・B それぞれ)。
+        /// F-10、E-05(項目2・3): マゼンタに近い画素だけを数える(許容差は R・G・B それぞれ)。
         #[test]
         fn magenta_ratio_counts_near_pixels() {
             let data = pixels(&[[255, 0, 255], [240, 10, 250], [255, 0, 200], [0, 0, 0]]);
@@ -267,6 +300,7 @@ mod logic {
             assert_eq!(distinct_colors(&[]), 0);
         }
 
+        /// F-10、E-05(項目2・3): 割合を、写っている(90% 以上)・写っていない(1% 以下)・一部に分ける。
         #[test]
         fn classify_uses_thresholds() {
             assert_eq!(classify(1.0), Seen::Visible);
@@ -276,7 +310,7 @@ mod logic {
             assert_eq!(classify(0.0), Seen::Hidden);
         }
 
-        /// 項目2: アフィニティなしで写り、ありで写らなければ除外できている。
+        /// F-10、E-05(項目2): アフィニティなしで写り、ありで写らなければ除外できている。
         /// なしでも写らなければ、除外の判定はできない。
         #[test]
         fn exclusion_needs_visible_overlay_without_affinity() {
@@ -302,6 +336,7 @@ mod logic {
             assert!(exclusion_text(Exclusion::Unknown).starts_with("判定できない"));
         }
 
+        /// spec.md 9章の検証項目(項目3): CAPTUREBLT の有無での写り方を、分類どうしで比べる。
         #[test]
         fn captureblt_text_compares_classes() {
             assert!(captureblt_text(Some(1.0), Some(0.95)).contains("変わらない"));
@@ -320,6 +355,7 @@ mod logic {
             assert_eq!(remaining_seconds(u64::MAX, 5000), None);
         }
 
+        /// 数は3桁ごとにカンマを入れ、大きさ・メモリ・割合・ハンドルを決まった形で書く。
         #[test]
         fn formats_numbers() {
             assert_eq!(group_digits(0), "0");
@@ -332,6 +368,7 @@ mod logic {
             assert_eq!(format_handle(0x1A2B), "0x1A2B");
         }
 
+        /// 項目1 の図形の位置は、0 から span までを周期で往復する(周期や span が不正なら 0)。
         #[test]
         fn bounce_goes_and_returns() {
             assert_eq!(bounce(0, 1000, 100.0), 0.0);
@@ -343,6 +380,7 @@ mod logic {
             assert_eq!(bounce(10, 1000, -1.0), 0.0);
         }
 
+        /// 矩形の中央に置く正方形の左上と、中央から切り出す範囲(矩形が小さければその大きさ、空なら None)。
         #[test]
         fn centered_and_center_crop() {
             assert_eq!(centered(0, 0, 1920, 1080, 200), (860, 440));
@@ -356,7 +394,7 @@ mod logic {
             assert_eq!(center_crop(0, 0, 0, 40, 100), None);
         }
 
-        /// 項目8: タイトルは出さず、分かっているウィンドウには名前を添える。
+        /// S-15(項目8): タイトルは出さず、分かっているウィンドウには名前を添える。
         #[test]
         fn describe_window_names_known_handles() {
             let known = [(0x10, "バナー")];
@@ -368,12 +406,46 @@ mod logic {
             assert_eq!(describe_window(None, &known), "なし");
         }
 
+        /// spec.md 9章の検証項目(項目8): クリックの直前・直後・200ms 後で前面が同じときだけ、フォーカスを保てたとみなす。
         #[test]
         fn focus_kept_needs_same_window_three_times() {
             assert!(focus_kept(Some(1), Some(1), Some(1)));
             assert!(!focus_kept(Some(1), Some(2), Some(2)));
             assert!(!focus_kept(Some(1), Some(1), None));
             assert!(!focus_kept(None, None, None));
+        }
+
+        /// spec.md 9章の検証項目(項目7、仮想マシン・リモートデスクトップ): Basic Render Driver は、
+        /// ソフトウェアの旗か、ID(0x1414、0x8C)で見分ける。
+        #[test]
+        fn is_basic_render_checks_flag_or_ids() {
+            // 主アダプターになった Basic Render Driver(旗は立たない)。
+            assert!(is_basic_render(0x1414, 0x8C, false));
+            // WARP のデバイスのアダプター(旗が立つ)。
+            assert!(is_basic_render(0x1414, 0x8C, true));
+            assert!(is_basic_render(0x10DE, 0x2504, true));
+            assert!(!is_basic_render(0x10DE, 0x2504, false));
+            // ID は2つとも合わなければ違う。
+            assert!(!is_basic_render(0x1414, 0x8D, false));
+            assert!(!is_basic_render(0x8086, 0x8C, false));
+        }
+
+        /// spec.md 9章の検証項目(項目7): アダプターは説明と ID を書き、ソフトウェアで描くならそう明記する。
+        #[test]
+        fn adapter_text_marks_basic_render() {
+            assert_eq!(
+                adapter_text("NVIDIA GeForce RTX 3060", 0x10DE, 0x2504, false),
+                "NVIDIA GeForce RTX 3060(VendorId 0x10DE、DeviceId 0x2504)"
+            );
+            assert_eq!(
+                adapter_text("Microsoft Basic Render Driver", 0x1414, 0x8C, false),
+                "Microsoft Basic Render Driver(VendorId 0x1414、DeviceId 0x008C)。\
+                 GPU ではなく、ソフトウェア(Microsoft Basic Render Driver)で描く"
+            );
+            assert_eq!(
+                adapter_text("", 0x1AB8, 0x10, false),
+                "説明なし(VendorId 0x1AB8、DeviceId 0x0010)"
+            );
         }
     }
 }
@@ -389,9 +461,9 @@ mod probe {
 
     use monitoaster::platform::probe_support::{self, MemoryInfo, StageOutcome};
     use monitoaster::platform::{
-        self, Canvas, CompositionSurface, ControlClass, Driver, DriverPreference, Error, Font,
-        GraphicsDevice, Message, Pump, Rgb, ScreenCapture, Stage, TrayIcon, Window, WindowClass,
-        WindowSpec,
+        self, AdapterInfo, Canvas, CompositionSurface, ControlClass, Driver, DriverPreference,
+        Error, Font, GraphicsDevice, Message, Pump, Rgb, ScreenCapture, Stage, TrayIcon, Window,
+        WindowClass, WindowSpec,
     };
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D1_COLOR_F};
@@ -507,10 +579,25 @@ mod probe {
         }
     }
 
+    /// ドライバーの種類。D3D_DRIVER_TYPE_HARDWARE でも GPU で描くとは限らないので、GPU とは書かない
+    /// (GPU のない環境では Microsoft Basic Render Driver になる。アダプターを添えて見分ける)。
     fn driver_name(driver: Driver) -> &'static str {
         match driver {
-            Driver::Hardware => "ハードウェア(GPU)",
+            Driver::Hardware => "D3D_DRIVER_TYPE_HARDWARE",
             Driver::Warp => "WARP(ソフトウェア)",
+        }
+    }
+
+    /// アダプターの説明と ID。読めなければ、その理由。
+    fn describe_adapter(adapter: &platform::Result<AdapterInfo>) -> String {
+        match adapter {
+            Ok(info) => logic::adapter_text(
+                &info.description,
+                info.vendor_id,
+                info.device_id,
+                info.software_flag,
+            ),
+            Err(error) => format!("読めなかった {}", describe_error(error)),
         }
     }
 
@@ -822,8 +909,9 @@ mod probe {
     fn report_device(out: &dyn Report, device: &GraphicsDevice) {
         let (major, minor) = device.feature_level();
         out.line(&format!(
-            "描画デバイス: {}、機能レベル {major}_{minor}",
-            driver_name(device.driver())
+            "描画デバイス: {}、機能レベル {major}_{minor}、アダプター: {}",
+            driver_name(device.driver()),
+            describe_adapter(&device.adapter())
         ));
         if let Some(error) = device.hardware_error() {
             out.line(&format!(
@@ -896,8 +984,8 @@ mod probe {
         out.line("## 1. オーバーレイの透過とクリック素通し");
         out.line(&format!("設定: {}", options.describe()));
         out.line(
-            "すること: 5秒の間に、オーバーレイの下にあるアプリ(メモ帳など)をクリックして文字を打つ。\
-             オーバーレイの図形の上をクリックしても、そのアプリに届くかを見る",
+            "すること: 先にメモ帳などを開いておく。このボタンを押したら5秒の間に、オーバーレイの下にある\
+             そのアプリをクリックして文字を打つ。オーバーレイの図形の上をクリックしても、そのアプリに届くかを見る",
         );
         out.line(
             "見えれば成功: 各モニターの縁に水色の枠が出て、半透明のオレンジの丸と紫の四角が動く。\
@@ -1358,7 +1446,7 @@ mod probe {
     fn item4_admin(out: &dyn Report, main: Window) {
         out.line("## 4. 管理者権限のアプリの取り込み");
         out.line(
-            "すること: 先に管理者権限で動くアプリ(タスクマネージャーなど。起動時に UAC の確認が出るもの)を\
+            "すること: 先に管理者権限で動くアプリ(管理者として実行したメモ帳、またはタスクマネージャー)を\
              開いておく。このボタンを押したら5秒以内にそのアプリをクリックして前面にし、そのまま待つ。\
              アプリの中央に文字や模様が見えている状態にする",
         );
@@ -1625,10 +1713,11 @@ mod probe {
             };
             out.line(&format!("| {} | {text} |", stage_name(*stage)));
         }
-        match (result.driver, result.feature_level) {
-            (Some(driver), Some((major, minor))) => out.line(&format!(
-                "ドライバー: {}、機能レベル {major}_{minor}",
-                driver_name(driver)
+        match (result.driver, result.feature_level, &result.adapter) {
+            (Some(driver), Some((major, minor)), Some(adapter)) => out.line(&format!(
+                "ドライバー: {}、機能レベル {major}_{minor}、アダプター: {}",
+                driver_name(driver),
+                describe_adapter(adapter)
             )),
             _ => out.line("ドライバー: D3D11 デバイスを作れなかった"),
         }
@@ -2293,6 +2382,13 @@ mod probe {
         out.line("# Monitoaster M0 技術検証(m0_probe)");
         out.line("使い方: 左のボタンで1項目ずつ実行します。結果はこの欄に追記されます。");
         out.line("- 各項目の「すること」に従って操作し、「見えれば成功」と見比べてください");
+        out.line(
+            "- 押す前の準備(1、2 の共有、4、8 は、押すとすぐに数え始めます): \
+             1 は、主モニターにメモ帳などを開いておく。\
+             2 の共有は、会議アプリで画面全体の共有を先に始めておく。\
+             4 は、管理者権限のアプリ(管理者として実行したメモ帳、またはタスクマネージャー)を先に開いておく。\
+             8 は、メモ帳を開いておく",
+        );
         out.line("- 最後に「結果をすべて選択」を押し、Ctrl+C で写して報告に貼り付けてください");
         out.line("- 報告に添えてほしいこと: Windows のバージョン(winver で確認)、モニターの台数と拡大率、GPU の種類");
         out.line("- 1、2・3、7 で問題が出たら、左下のチェックボックスで設定を変えて、もう一度試してください");

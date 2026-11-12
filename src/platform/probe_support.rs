@@ -14,10 +14,10 @@ use windows::core::{Error, Result};
 
 use super::Window;
 use super::graphics::{
-    Driver, DriverPreference, Stage, attach_visual, create_composition_device,
-    create_composition_target, create_d2d_context, create_d2d_device, create_d2d_factory,
-    create_d3d_device, create_dxgi_factory, create_swap_chain, create_target_bitmap, dxgi_device,
-    feature_level_numbers,
+    AdapterInfo, Driver, DriverPreference, Stage, adapter_info, attach_visual,
+    create_composition_device, create_composition_target, create_d2d_context, create_d2d_device,
+    create_d2d_factory, create_d3d_device, create_dxgi_factory, create_swap_chain,
+    create_target_bitmap, dxgi_device, feature_level_numbers,
 };
 
 /// コンソールから切り離す(FreeConsole)。
@@ -83,6 +83,9 @@ pub struct StagedInit {
     pub stages: Vec<(Stage, StageOutcome)>,
     /// D3D11 デバイスを作れたドライバー。
     pub driver: Option<Driver>,
+    /// D3D11 デバイスが使うアダプター(デバイスを作れなければ None、情報を読めなければ Some(Err))。
+    /// [`Driver::Hardware`] でも、GPU のない環境では Microsoft Basic Render Driver になる。
+    pub adapter: Option<Result<AdapterInfo>>,
     /// D3D の機能レベル(11_0 なら (11, 0))。
     pub feature_level: Option<(u32, u32)>,
     /// ハードウェアでの D3D11 デバイスの作成に失敗した理由(試していなければ None)。
@@ -90,6 +93,8 @@ pub struct StagedInit {
 }
 
 /// 描画の初期化を1段ずつ試し、各段の成否を返す(検証項目7)。作ったものは戻る前にすべて捨てる。
+///
+/// D3D11 デバイスを作れたら、すぐにそのアダプターの情報も読む。
 ///
 /// 順序: D3D11 デバイス → IDXGIDevice → CreateDXGIFactory2 → CreateSwapChainForComposition
 /// (64×64)→ DCompositionCreateDevice → `window` への CreateTargetForHwnd → ビジュアル → Commit →
@@ -112,6 +117,7 @@ pub fn staged_graphics_init(preference: DriverPreference, window: Window) -> Sta
             (None, None, None, error.hardware)
         }
     };
+    let adapter = device.as_ref().map(adapter_info);
     let mut log = StageLog(&mut stages);
     let dxgi = log.step(Stage::DxgiDevice, device.as_ref().map(dxgi_device));
     let factory = log.step(Stage::DxgiFactory, Some(create_dxgi_factory()));
@@ -210,6 +216,7 @@ pub fn staged_graphics_init(preference: DriverPreference, window: Window) -> Sta
     StagedInit {
         stages,
         driver,
+        adapter,
         feature_level,
         hardware_error,
     }
@@ -235,6 +242,7 @@ impl StageLog<'_> {
 mod tests {
     use super::*;
 
+    /// spec.md 8章: このプロセスのメモリの使用量を測れる(作業セットは 0 より大きく、最大値を超えない)。
     #[test]
     fn memory_info_reports_nonzero_working_set() {
         let info = memory_info().expect("メモリの使用量");

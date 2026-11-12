@@ -161,6 +161,7 @@ fn buffer_len(width: i32, height: i32) -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// 画素のバイト数は、幅か高さが 0 以下のときと、桁があふれるときは求めない。
     #[test]
     fn buffer_len_rejects_empty_and_overflow() {
         assert_eq!(buffer_len(200, 100), Some(80_000));

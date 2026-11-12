@@ -25,7 +25,8 @@ use windows::Win32::System::LibraryLoader::{
 
 pub use capture::ScreenCapture;
 pub use graphics::{
-    Canvas, CompositionSurface, Driver, DriverPreference, GraphicsDevice, Stage, StageError,
+    AdapterInfo, Canvas, CompositionSurface, Driver, DriverPreference, GraphicsDevice, Stage,
+    StageError,
 };
 pub use instance::{Instance, InstanceLock, acquire_instance};
 pub use monitor::{Monitor, monitors};
@@ -65,6 +66,7 @@ pub fn from_wide(wide: &[u16]) -> String {
 mod tests {
     use super::*;
 
+    /// 日本語の文字列は、UTF-16 との往復で変わらない(NUL で終わる)。
     #[test]
     fn wide_round_trip_keeps_japanese() {
         let wide = to_wide("監視を開始");
@@ -72,6 +74,7 @@ mod tests {
         assert_eq!(from_wide(&wide), "監視を開始");
     }
 
+    /// 最初の NUL の手前までを文字列にする(NUL がなければ全体)。
     #[test]
     fn from_wide_stops_at_first_nul() {
         let wide = [0x41, 0x42, 0, 0x43];

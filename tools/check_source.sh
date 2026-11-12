@@ -26,7 +26,9 @@
 #     LoadLibraryW(w!("ws2_32.dll")) のように、名前を文字列で渡して動的に呼ぶ抜け道を塞ぐため。
 #     画面の文言(日本語、text.rs に集約)にこれらの英字の名前が入ることはまずなく、誤検知の心配は小さい。
 # - 複数行にまたがる use と属性は、1つにつなぎ、識別子どうしの間以外の空白を詰めてから調べる
-#   (rustfmt は use std::{...} を複数行に折る)。
+#   (rustfmt は use std::{...} を複数行に折る)。use の中の波かっこだけの入れ子
+#   (use std::fs::{self, {write}}。#[rustfmt::skip] で残せる)は、ほどいてから調べる。
+# - 生識別子(std::fs::r#write)は、文字列の中身を消した行では r# を除いて読む。
 # - 語の区切りは [A-Za-z0-9_] で判定する。LC_ALL=C にして、ロケールで文字の扱いが変わらないようにする
 #   (Windows の Git Bash でも同じ結果になるように。grep -P、\b、\w は使わない)。
 # - 行末の CR は除いてから調べる(CRLF で取り出されたソースでも同じ結果になる)。
@@ -39,7 +41,10 @@
 #   std::net と std::process::Command は exe の検査(ws2_32、CreateProcessW のインポート)でも拾える。
 # - マクロにパスの部品を別々に渡して組み立てる書き方(macro_rules! m { ($a:ident, $b:ident) =>
 #   { $a::$b::TcpStream::connect(..) } } を m!(std, net) で呼ぶ等)。exe の検査で拾える。
-#   use の別名(use std::process as p)、glob(use std::fs::*)、std 自体の別名は拾う。
+#   use の別名(use std::process as p、use std::fs::File as F)、glob(use std::fs::*)、std 自体の別名は拾う。
+# - File を別の名前で呼ぶ書き方(type F = std::fs::File; の後の F::create(..)、impl X for File の中の Self::create(..))。
+# - 属性をマクロの断片で渡す書き方(macro_rules! m { ($a:meta) => { #[$a] mod x; } } を
+#   m!(path = "...") で呼ぶ等)。#[path = ...] の検査は属性の中の path= を見るため。
 # - 自前の識別子が禁止API名で始まると誤検知する(例: mouse_event_count)。名前を変えて避ける。
 #   自前の型に Command::new があっても S-05 で誤検知する。
 # - 依存クレート(windows、serde、serde_json)の中身は調べない。S-12(cargo-deny)が受け持つ。
@@ -64,18 +69,28 @@ BANNED_API=(
 # 設定の保存は src/config.rs が std::fs で行うので、Win32 のファイルAPIは要らない。
 WIN32_WRITE_API=(
   CreateFile WriteFile DeleteFile MoveFile CopyFile ReplaceFile
+  CreateDirectory RemoveDirectory CreateHardLink CreateSymbolicLink SetFileAttributes
   RegSetValue RegSetKeyValue RegCreateKey SHSetValue
-  OpenClipboard SetClipboardData
-  WritePrivateProfile # INI ファイルへの書き込み
-  SHFileOperation IFileOperation # シェルのファイル操作(コピー、移動、削除)
+  OpenClipboard SetClipboardData OleSetClipboard
+  WritePrivateProfile WriteProfile # INI ファイル(win.ini も。WriteProfileString、WriteProfileSection)への書き込み
+  SHFileOperation IFileOperation SHCreateDirectory # シェルのファイル操作(コピー、移動、削除、フォルダー作成)
+  # メタファイル。そのDCに画面から BitBlt すると、画面の内容がファイルに残る
+  CreateEnhMetaFile CreateMetaFile CopyEnhMetaFile CopyMetaFile
+  # ntdll と kernel32 のファイルを開く・作るAPI。どちらのDLLも許可リストにあり、ntdll の NtCreateFile は
+  # 標準ライブラリもインポートするので、exe の検査では拾えない
+  NtCreateFile ZwCreateFile NtOpenFile ZwOpenFile NtDeleteFile ZwDeleteFile
+  ReOpenFile OpenFile _lcreat _lopen GetTempFileName # OpenFile は OpenFileById にも OpenFileMapping にも当たる
 )
 
-# S-03、S-06: std::fs で書き込む関数(fs:: の後ろの前方一致)。src/config.rs の外で禁止。
-# create_dir は create_dir_all、remove_dir は remove_dir_all にも当たる。
+# S-03、S-06: std::fs で書き込む関数(fs:: の直後と、use の fs::{...} の中の名前の前方一致)。
+# src/config.rs の外で禁止。create_dir は create_dir_all、remove_dir は remove_dir_all にも当たる。
+# symlink とだけ書くと読むだけの fs::symlink_metadata に当たるので、Windows の2つを名前で挙げ、
+# std::os::unix::fs::symlink は語の終わりまでの一致で別に調べる(FS_SYMLINK)。
 FS_WRITE_FN=(
   write rename remove_file remove_dir create_dir copy hard_link set_permissions
-  soft_link symlink # std::os::windows::fs::symlink_file なども fs::symlink で当たる
+  soft_link symlink_file symlink_dir # std::os::windows::fs の symlink_file、symlink_dir
 )
+FS_SYMLINK=symlink
 
 # S-01: 通信に使うDLL(大文字小文字を区別しない前方一致)。tools/check_exe.sh の NET_DLLS と同じ。
 NET_DLLS=(ws2_32 mswsock winhttp wininet urlmon iphlpapi dnsapi)
@@ -178,6 +193,10 @@ function lex(line,    n, i, j, k, h, c, c2, rest) {
         }
       }
     }
+    if (c == "r" && substr(line, i + 1, 1) == "#" && substr(line, i + 2, 1) ~ /[A-Za-z_]/ \
+        && (i == 1 || substr(line, i - 1, 1) !~ /[A-Za-z0-9_]/)) {
+      os = os "r#"; i += 2; continue          # 生識別子。r#write は code では write として読む
+    }
     if (c == "\047") {                        # 文字リテラルか、ライフタイム・ラベルか
       if (substr(line, i + 1, 1) == "\\") {   # 例: \047\\n\047 \047\\\047\047 \047\\u{1F600}\047
         k = i + 3
@@ -213,8 +232,26 @@ function squeeze(s,    out, n, i, ch, prev) {
   }
   return out
 }
-function end_unit() {
-  print path "\t" ustart "\t" udepth "\t" squeeze(ubuf) > (OUT "/units.tsv")
+function unbrace(s,    out, n, i, ch, prev, sp) { # use の波かっこだけの入れ子をほどく({a,{b}} → {a,b})
+  out = ""; sp = 0; n = length(s)
+  for (i = 1; i <= n; i++) {
+    ch = substr(s, i, 1)
+    if (ch == "{") {
+      prev = substr(out, length(out), 1); sp++
+      ubare[sp] = (prev == "{" || prev == ",")  # 前にパスがない {
+      if (ubare[sp]) continue
+    } else if (ch == "}" && sp > 0) {
+      sp--
+      if (ubare[sp + 1]) continue
+    }
+    out = out ch
+  }
+  return out
+}
+function end_unit(    s) {
+  s = squeeze(ubuf)
+  if (ukind == "use") s = unbrace(s)
+  print path "\t" ustart "\t" udepth "\t" s > (OUT "/units.tsv")
   ukind = ""; ubuf = ""
 }
 function track(s,    n, i, ch, rest) {
@@ -411,11 +448,12 @@ if [[ ${#cargo_configs[@]} -gt 0 ]]; then
 fi
 report "S-11" ".cargo/config.toml に unsafe_code を緩める指定(-A unsafe_code、--cap-lints など)がない" "$hits"
 
+# path は属性の中のどこにあっても NG(#[cfg_attr(all(), path = "...")] のような書き方も)。
 hits=$(
-  scan units "" "" "^#!?[[]path="
+  scan units "" "" "^#" "${B}path="
   scan code "" "" "${B}include *!"
 )
-report "S-11" "検査の外のファイルをモジュールとして取り込む #[path = ...] と include! がない" "$hits"
+report "S-11" "検査の外のファイルをモジュールとして取り込む #[path = ...](cfg_attr 経由も)と include! がない" "$hits"
 
 # ---- S-01 通信しない -------------------------------------------------------------------
 
@@ -447,17 +485,23 @@ report "S-04 S-05" "禁止API名($(join_alt "${BANNED_API[@]}" | tr -d '()' | se
 
 # ---- S-03、S-06 ファイルに書くのは config.rs だけ ----------------------------------------
 
+# use の照合は「fs:: の直後、または fs::{...} の中の名前」だけに当たる1つの正規表現にする
+# (use std::{fs::File, io::copy} の io::copy に当たらないように)。use std::fs; use fs::write; の
+# ように std を同じ use に書かない形もあるので、std の有無は問わない。
+FS_IN_USE="${B}fs::([{]([^{}]*,)?)?($(join_alt "${FS_WRITE_FN[@]}")[A-Za-z0-9_]*|${FS_SYMLINK})${E}"
 hits=$(
   scan code "$CONFIG" "" "${B}fs *:: *$(join_alt "${FS_WRITE_FN[@]}")"
-  scan code "$CONFIG" "" "${B}File *:: *(create|options)"
-  scan code "$CONFIG" "" "${B}OpenOptions"
-  scan units "$CONFIG" "" "$USE" "$STD" "${B}fs${E}" "${B}($(join_alt "${FS_WRITE_FN[@]}")[A-Za-z0-9_]*|OpenOptions)${E}"
-  scan units "$CONFIG" "" "$USE" "$STD" "$(glob_or_alias fs)"
+  scan code "$CONFIG" "" "${B}fs *:: *${FS_SYMLINK}${E}"
+  scan code "$CONFIG" "" "${B}File *(> *)?:: *(create|options)" # <std::fs::File>::create も
+  scan code "$CONFIG" "" "${B}(OpenOptions|DirBuilder)"
+  scan units "$CONFIG" "" "$USE" "$FS_IN_USE"
+  scan units "$CONFIG" "" "$USE" "${B}File as${E}" # File の別名で File::create の照合を逃れられるため
+  scan units "$CONFIG" "" "$USE" "$(glob_or_alias fs)"
 )
-report "S-03 S-06" "std::fs の書き込み(fs::write、File::create、OpenOptions など)が src/config.rs の外にない" "$hits"
+report "S-03 S-06" "std::fs の書き込み(fs::write、File::create、OpenOptions、DirBuilder など)が src/config.rs の外にない" "$hits"
 
 hits=$(scan str "" "" "${B}$(join_alt "${WIN32_WRITE_API[@]}")")
-report "S-03 S-06" "Win32 のファイル・レジストリ・クリップボードへの書き込みAPI(CreateFile、RegSetValue、SetClipboardData など)がない" "$hits"
+report "S-03 S-06" "Win32 のファイル・レジストリ・クリップボード・メタファイルへの書き込みAPI(CreateFile、RegSetValue、SetClipboardData、CreateEnhMetaFile など)がない" "$hits"
 
 # ---- std の別名と glob import(S-01、S-03、S-05 の検査を逃れられるため) --------------------
 

@@ -1,8 +1,10 @@
 //! 描画デバイスと、ウィンドウに重ねる描画面(spec.md 9章: DirectComposition のスワップチェーンに
 //! Direct2D で描く)。
 //!
-//! - [`GraphicsDevice`]: D3D11 デバイス(ハードウェア、だめなら WARP)、DXGI ファクトリー、
-//!   DirectComposition デバイス、Direct2D デバイス。演出の開始時に作り、終了時に捨てる(8章)。
+//! - [`GraphicsDevice`]: D3D11 デバイス(D3D_DRIVER_TYPE_HARDWARE、だめなら WARP)、DXGI
+//!   ファクトリー、DirectComposition デバイス、Direct2D デバイス。演出の開始時に作り、終了時に
+//!   捨てる(8章)。描画に使うアダプターは [`GraphicsDevice::adapter`] で分かる(GPU のない環境では
+//!   D3D_DRIVER_TYPE_HARDWARE でも Microsoft Basic Render Driver になり、描画はソフトウェアで行われる)。
 //! - [`CompositionSurface`]: ウィンドウ1つ分の描画面。composition 用のスワップチェーン
 //!   (B8G8R8A8、プリマルチプライドα、FLIP_SEQUENTIAL、2枚)、DirectComposition のターゲット
 //!   (最前面)とビジュアル、Direct2D のデバイスコンテキストとブラシ。
@@ -48,13 +50,14 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_PRESENT, DXGI_SCALING_STRETCH,
-    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
-    IDXGIAdapter, IDXGIDevice, IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
+    CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, DXGI_PRESENT,
+    DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIFactory2,
+    IDXGISurface, IDXGISwapChain1,
 };
 use windows::core::{Error, Interface, Result};
 
-use super::Window;
+use super::{Window, from_wide};
 
 /// Send でも Sync でもなくするための印(Direct2D の SINGLE_THREADED を守る)。
 type SingleThread = PhantomData<*const ()>;
@@ -62,7 +65,7 @@ type SingleThread = PhantomData<*const ()>;
 /// どのドライバーで D3D11 デバイスを作るか。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DriverPreference {
-    /// ハードウェアを試し、だめなら WARP(ソフトウェア)。
+    /// D3D_DRIVER_TYPE_HARDWARE を試し、だめなら WARP(ソフトウェア)。
     HardwareThenWarp,
     /// WARP だけ。
     WarpOnly,
@@ -71,7 +74,8 @@ pub enum DriverPreference {
 /// D3D11 デバイスを作れたドライバー。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Driver {
-    /// GPU。
+    /// D3D_DRIVER_TYPE_HARDWARE(既定のアダプター。GPU のない環境では Microsoft Basic Render Driver
+    /// になる)。GPU で描くとは限らないので、アダプターは [`GraphicsDevice::adapter`] で確かめる。
     Hardware,
     /// WARP(CPU で描くソフトウェアのドライバー)。
     Warp,
@@ -201,6 +205,38 @@ pub(super) fn dxgi_device(device: &ID3D11Device) -> Result<IDXGIDevice> {
     device.cast()
 }
 
+/// 描画に使うアダプター(DXGI_ADAPTER_DESC1 の一部)。
+///
+/// GPU のない仮想マシンやリモートデスクトップでは、D3D_DRIVER_TYPE_HARDWARE で作っても
+/// Microsoft Basic Render Driver(VendorId 0x1414、DeviceId 0x8C)になり、ソフトウェアで描く。
+/// 主アダプターが Basic Render Driver のときは `software_flag` が立たないので、ID でも見分ける。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdapterInfo {
+    /// アダプターの説明(GPU の製品名など。例: 「Microsoft Basic Render Driver」)。
+    pub description: String,
+    /// PCI のベンダー ID(Microsoft は 0x1414)。
+    pub vendor_id: u32,
+    /// PCI のデバイス ID。
+    pub device_id: u32,
+    /// DXGI_ADAPTER_FLAG_SOFTWARE が立っているか。
+    pub software_flag: bool,
+}
+
+/// D3D11 デバイスが使っているアダプターの情報(IDXGIDevice::GetAdapter → IDXGIAdapter1::GetDesc1)。
+pub(super) fn adapter_info(device: &ID3D11Device) -> Result<AdapterInfo> {
+    let dxgi = dxgi_device(device)?;
+    // SAFETY: dxgi は有効な COM のインターフェース。返るアダプターは参照を持つ。
+    let adapter: IDXGIAdapter1 = unsafe { dxgi.GetAdapter() }?.cast()?;
+    // SAFETY: adapter は有効な COM のインターフェース。説明は値として受け取る。
+    let desc = unsafe { adapter.GetDesc1() }?;
+    Ok(AdapterInfo {
+        description: from_wide(&desc.Description).trim().to_string(),
+        vendor_id: desc.VendorId,
+        device_id: desc.DeviceId,
+        software_flag: desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+    })
+}
+
 /// DXGI のファクトリー(CreateDXGIFactory2)。
 pub(super) fn create_dxgi_factory() -> Result<IDXGIFactory2> {
     // SAFETY: フラグを渡すだけ(デバッグ層は使わない)。
@@ -245,7 +281,10 @@ pub(super) fn create_composition_target(
     composition: &IDCompositionDevice,
     hwnd: HWND,
 ) -> Result<IDCompositionTarget> {
-    // SAFETY: HWND を渡すだけ。自分のプロセスのトップレベルウィンドウでなければ失敗する。
+    // SAFETY: composition は有効な COM のインターフェース。hwnd は値として渡すだけで、ポインター
+    // としては読まれない。ウィンドウはトップレベルでも子でもよい。呼び出したプロセスのウィンドウで
+    // ないとき(DCOMPOSITION_ERROR_ACCESS_DENIED)、無効なハンドルのとき、topmost のターゲットが
+    // すでにあるときは、失敗を返すだけ。
     unsafe { composition.CreateTargetForHwnd(hwnd, true) }
 }
 
@@ -361,6 +400,12 @@ impl GraphicsDevice {
     /// 作れたドライバー。
     pub fn driver(&self) -> Driver {
         self.driver
+    }
+
+    /// 描画に使うアダプター。[`Driver::Hardware`] でも、GPU のない環境では
+    /// Microsoft Basic Render Driver(ソフトウェア)になる。
+    pub fn adapter(&self) -> Result<AdapterInfo> {
+        adapter_info(&self.d3d)
     }
 
     /// D3D の機能レベル(11_0 なら `(11, 0)`)。
@@ -538,6 +583,7 @@ mod tests {
     use super::*;
     use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_9_1, D3D_FEATURE_LEVEL_11_0};
 
+    /// D3D_FEATURE_LEVEL の値を、主と副の番号(11_0 なら (11, 0))に分ける。
     #[test]
     fn feature_level_numbers_split_major_minor() {
         assert_eq!(feature_level_numbers(D3D_FEATURE_LEVEL_11_0), (11, 0));
